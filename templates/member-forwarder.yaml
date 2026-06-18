@@ -1,0 +1,95 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS Backup DevOps Agent v9 - Member Account Forwarder (StackSet).
+  Deploys forwarding rule (per Region) and IAM roles (once, global).
+
+Parameters:
+  DelegatedAdminAccountId:
+    Type: String
+  CentralRegion:
+    Type: String
+  AgentSpaceArn:
+    Type: String
+    Description: ARN of the DevOps Agent space (for investigation role trust scoping)
+
+Conditions:
+  IsNotAdmin: !Not [!Equals [!Ref "AWS::AccountId", !Ref DelegatedAdminAccountId]]
+  IsCentralRegion: !Equals [!Ref "AWS::Region", !Ref CentralRegion]
+  CreateRule: !Condition IsNotAdmin
+  CreateIAM: !And [!Condition IsNotAdmin, !Condition IsCentralRegion]
+
+Resources:
+  # ── EventBridge forwarding rule (every Region) ──
+  ForwardingRule:
+    Type: AWS::Events::Rule
+    Condition: CreateRule
+    Properties:
+      Name: ForwardBackupFailures-ToCentral
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.backup
+        detail-type:
+          - Backup Job State Change
+          - Copy Job State Change
+        detail:
+          state:
+            - FAILED
+            - ABORTED
+            - EXPIRED
+      Targets:
+        - Id: CentralBus
+          Arn: !Sub arn:aws:events:${CentralRegion}:${DelegatedAdminAccountId}:event-bus/default
+          RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/BackupEventForwardingRole
+
+  # ── IAM: Forwarding role (once per account) ──
+  ForwardingRole:
+    Type: AWS::IAM::Role
+    Condition: CreateIAM
+    DeletionPolicy: Retain
+    Properties:
+      RoleName: BackupEventForwardingRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PutEvents
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: events:PutEvents
+                Resource: !Sub arn:aws:events:${CentralRegion}:${DelegatedAdminAccountId}:event-bus/default
+
+  # ── IAM: Investigation role (once per account) ──
+  # Trust: aidevops.amazonaws.com scoped to your admin account + agent space
+  # Permissions: AWS-managed AIDevOpsAgentAccessPolicy (read-only, maintained by AWS)
+  InvestigationRole:
+    Type: AWS::IAM::Role
+    Condition: CreateIAM
+    DeletionPolicy: Retain
+    Properties:
+      RoleName: DevOpsAgentInvestigationRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref DelegatedAdminAccountId
+              ArnLike:
+                aws:SourceArn: !Ref AgentSpaceArn
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsAgentAccessPolicy
+
+Outputs:
+  InvestigationRoleArn:
+    Condition: CreateIAM
+    Value: !GetAtt InvestigationRole.Arn
