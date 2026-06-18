@@ -46,6 +46,17 @@ cd aws-backup-devops-agent-v9
 
 ## File 1: templates/main-stack.yaml
 
+**What this does:** Deploys all resources in the **delegated administrator account**. Specifically:
+
+- **Secrets Manager secret** — stores the DevOps Agent webhook URL and HMAC secret securely
+- **SNS topic + email subscription** — delivers RCA summaries to your inbox
+- **EventBus policy** — allows any account in your organization to send events to this account's default event bus (scoped by `aws:PrincipalOrgID`)
+- **EventBridge rule #1** (`BackupFailures-TriggerInvestigation`) — catches backup/copy job events in FAILED, ABORTED, or EXPIRED state and invokes the bridge Lambda
+- **EventBridge rule #2** (`BackupRCA-SendEmail`) — catches DevOps Agent's "Investigation Complete" event and invokes the emailer Lambda
+- **Lambda #1** (`BackupFailureBridge`) — reads the webhook secret, builds the incident payload, HMAC-signs it, and POSTs to the DevOps Agent webhook to start an investigation
+- **Lambda #2** (`BackupRCAEmailer`) — formats the investigation results into a human-readable email and publishes to the SNS topic
+- **IAM roles** (2) — least-privilege execution roles for each Lambda (one can read the secret, the other can publish to SNS)
+
 Copy and save as `templates/main-stack.yaml`:
 
 ```yaml
@@ -308,6 +319,14 @@ Outputs:
 
 ## File 2: templates/member-forwarder.yaml
 
+**What this does:** Deployed via CloudFormation StackSet to **every member account** in your organization. Creates:
+
+- **EventBridge forwarding rule** (`ForwardBackupFailures-ToCentral`) — deployed in *every Region* you select. Matches FAILED/ABORTED/EXPIRED backup and copy job events and sends them to the delegated admin's central event bus. This is how failures from any account/Region reach the investigation pipeline.
+- **Forwarding IAM role** (`BackupEventForwardingRole`) — created *once per account* (IAM is global). Allows the EventBridge service to call `events:PutEvents` on the delegated admin's bus.
+- **Investigation IAM role** (`DevOpsAgentInvestigationRole`) — created *once per account*. This is the role that AWS DevOps Agent assumes when it investigates a failure in this account. It trusts the `aidevops.amazonaws.com` service principal (scoped to your admin account and agent space), and uses the AWS-managed `AIDevOpsAgentAccessPolicy` for read-only investigation access.
+
+> **Conditions built in:** The template skips the delegated admin account (it doesn't need to forward to itself) and creates IAM roles only in the central Region (avoiding naming conflicts since IAM is global).
+
 Copy and save as `templates/member-forwarder.yaml`:
 
 ```yaml
@@ -409,6 +428,20 @@ Outputs:
 ---
 
 ## File 3: deploy.sh
+
+**What this does:** Orchestrates the entire deployment in 7 automated steps:
+
+| Step | Action | Automated? |
+|------|--------|------------|
+| 1 | Creates (or reuses) a DevOps Agent Space named `BackupInvestigations` | ✓ |
+| 2 | Creates the primary IAM role (`DevOpsAgentBackupRole`) with correct trust policy and associates your admin account with the agent space | ✓ |
+| 3 | **Pauses** for you to create the HMAC webhook in the console and paste the URL + secret | Manual (secret shown only once) |
+| 4 | Deploys the main CloudFormation stack (all delegated admin resources from File 1) | ✓ |
+| 5 | Creates/updates the StackSet and deploys it to all member accounts across your chosen Regions (File 2) | ✓ |
+| 6 | Loops through all member accounts in the target OU and registers each one as a secondary source in the agent space (required for cross-account investigation) | ✓ |
+| 7 | Sends a synthetic test event and reminds you to connect Slack | ✓ |
+
+The script is **idempotent** — safe to re-run. It handles existing resources, cleans up failed stacks, and waits for in-progress operations.
 
 Copy and save as `deploy.sh`, then run `chmod +x deploy.sh`:
 
